@@ -605,7 +605,10 @@ class PDBFixer(object):
         existingAtomMap = {}
         addedAtomMap = {}
         addedHeterogenBonds = []
-        residueCenters = [self._computeResidueCenter(res).value_in_unit(unit.nanometers) for res in self.topology.residues()]*unit.nanometers
+        # Residue centers are only needed when placing missing residues.  Most
+        # atom repairs do not add residues, so avoid scanning all their positions.
+        if self.missingResidues:
+            residueCenters = [self._computeResidueCenter(res).value_in_unit(unit.nanometers) for res in self.topology.residues()]*unit.nanometers
         for chain in self.topology.chains():
             if omitUnknownMolecules and all(self._getTemplate(residue.name) is None for residue in chain.residues()):
                 continue
@@ -617,9 +620,9 @@ class PDBFixer(object):
 
                 if (chain.index, indexInChain) in self.missingResidues:
                     insertHere = self.missingResidues[(chain.index, indexInChain)]
-                    endPosition = self._computeResidueCenter(residue)
+                    endPosition = residueCenters[residue.index]
                     if indexInChain > 0:
-                        startPosition = self._computeResidueCenter(chainResidues[indexInChain-1])
+                        startPosition = residueCenters[chainResidues[indexInChain-1].index]
                         loopDirection = _findUnoccupiedDirection((startPosition+endPosition)/2, residueCenters)
                     else:
                         outward = _findUnoccupiedDirection(endPosition, residueCenters)*unit.nanometers
@@ -689,7 +692,7 @@ class PDBFixer(object):
                 if residue == chainResidues[-1] and (chain.index, indexInChain+1) in self.missingResidues:
                     insertHere = self.missingResidues[(chain.index, indexInChain+1)]
                     if len(insertHere) > 0:
-                        startPosition = self._computeResidueCenter(residue)
+                        startPosition = residueCenters[residue.index]
                         outward = _findUnoccupiedDirection(startPosition, residueCenters)*unit.nanometers
                         norm = unit.norm(outward)
                         if norm > 0*unit.nanometer:
@@ -888,21 +891,26 @@ class PDBFixer(object):
         """
         chains = [c for c in self.topology.chains() if len(list(c.residues())) > 0]
         chainWithGaps = {}
+        chainKnownResidues = {}
 
         # Find the sequence of each chain, with gaps for missing residues.
 
         for chain in chains:
             residues = list(chain.residues())
-            ids = [int(r.id) for r in residues]
-            for i, res in enumerate(residues):
+            ids = []
+            insertionOffset = 0
+            for res in residues:
+                # Each insertion shifts this residue and all subsequent residues.
                 if res.insertionCode not in ('', ' '):
-                    for j in range(i, len(residues)):
-                        ids[j] += 1
+                    insertionOffset += 1
+                ids.append(int(res.id)+insertionOffset)
             minResidue = min(ids)
             maxResidue = max(ids)
             chainWithGaps[chain] = [None]*(maxResidue-minResidue+1)
             for r, id in zip(residues, ids):
                 chainWithGaps[chain][id-minResidue] = r.name
+            # Gaps match any residue, so only the observed positions need comparing.
+            chainKnownResidues[chain] = [(i, name) for i, name in enumerate(chainWithGaps[chain]) if name is not None]
 
         # Try to find the chain that matches each sequence.
 
@@ -915,7 +923,7 @@ class PDBFixer(object):
                 if chain in chainSequence:
                     continue
                 for offset in range(len(sequence.residues)-len(chainWithGaps[chain])+1):
-                    if all(a == b or b == None for a,b in zip(sequence.residues[offset:], chainWithGaps[chain])):
+                    if all(sequence.residues[offset+i] == name for i, name in chainKnownResidues[chain]):
                         chainSequence[chain] = sequence
                         chainOffset[chain] = offset
                         break
@@ -1391,7 +1399,15 @@ class PDBFixer(object):
         >>> fixer.addMissingHydrogens(pH=8.0)
         """
         extraDefinitions = self._downloadNonstandardDefinitions()
-        variants = [self._describeVariant(res, extraDefinitions) for res in self.topology.residues()]
+        # Leaving hydrogens depend on external bonds.  Index those bonds once
+        # instead of scanning the whole topology for every nonstandard residue.
+        hasExternalBonds = set()
+        if extraDefinitions or any(name not in self._standardTemplates for name in self.templates):
+            for atom1, atom2 in self.topology.bonds():
+                if atom1.residue != atom2.residue:
+                    hasExternalBonds.add(atom1)
+                    hasExternalBonds.add(atom2)
+        variants = [self._describeVariant(res, extraDefinitions, hasExternalBonds) for res in self.topology.residues()]
         modeller = app.Modeller(self.topology, self.positions)
         modeller.addHydrogens(pH=pH, forcefield=forcefield, variants=variants, platform=self.platform)
         self.topology = modeller.topology
@@ -1417,7 +1433,7 @@ class PDBFixer(object):
                 definitions[name] = (atoms, bonds)
         return definitions
 
-    def _describeVariant(self, residue, definitions):
+    def _describeVariant(self, residue, definitions, hasExternalBonds=None):
         """Build the variant description to pass to addHydrogens() for a residue."""
         if residue.name not in self._standardTemplates and self._getTemplate(residue.name) is not None:
             # The user has registered a template for this residue.  Use the hydrogens from it.
@@ -1453,7 +1469,6 @@ class PDBFixer(object):
 
         variant = []
         definitionAtoms = dict((atom[0], atom) for atom in atoms)
-        topologyBonds = list(residue.bonds())
         for name1, name2 in bonds:
             if definitionAtoms[name1][1] == 'H':
                 h, parent = name1, name2
@@ -1467,15 +1482,14 @@ class PDBFixer(object):
                 if parent not in topologyHeavy:
                     continue
                 parentAtom = topologyHeavy[parent]
-                exclude = False
-                for atom1, atom2 in topologyBonds:
-                    if atom1 == parentAtom and atom2.residue != residue:
-                        exclude = True
-                        break
-                    if atom2 == parentAtom and atom1.residue != residue:
-                        exclude = True
-                        break
-                if exclude:
+                if hasExternalBonds is None:
+                    # Also support callers that describe just one residue.
+                    hasExternalBonds = set()
+                    for atom1, atom2 in residue.chain.topology.bonds():
+                        if atom1.residue != atom2.residue:
+                            hasExternalBonds.add(atom1)
+                            hasExternalBonds.add(atom2)
+                if parentAtom in hasExternalBonds:
                     continue
             variant.append((h, parent))
         return variant
